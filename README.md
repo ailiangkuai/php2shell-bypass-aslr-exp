@@ -2,6 +2,8 @@
 
 中文 | [English](readme_en.md)
 
+> 姊妹模式：PHP **5.6.40 + nginx (php-fpm)** 的 RCE 复现（FastCGI 直连路径）见 [docker56/README.md](docker56/README.md)。
+
 在“完全远程、只用 HTTP、目标页面无 `session_start()`、不写任何目标侧 PHP”的约束下，用**一个 `exploit.py`** 打通 PHP 8.4.26 + Apache prefork + mod_php 的 RCE。官方 `php:8.4.26-apache` 镜像已实测 **3/3** 一键成功（`PROOF: uid=33(www-data)...`）。当前版本要求 `display_errors=1`；`display_errors=0` 已打通纯 HTTP 堆泄漏，完整 RCE 稍后提交。
 
 ## exp
