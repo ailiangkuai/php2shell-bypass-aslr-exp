@@ -1,0 +1,38 @@
+services:
+  # PHP 8.4.26 FPM target — CVE-2026-109618 / CVE-2026-109619 simulation.
+  #
+  # IMPORTANT: the fpm service publishes NO ports. It is reachable only
+  # inside the compose network (web -> fpm:9000), mirroring a real
+  # nginx+php-fpm production stack where FastCGI is never exposed.
+  # All attack traffic enters through nginx :80 (published as 127.0.0.1:8090).
+  #
+  # PHP_IMAGE switches the PHP version for A/B comparison:
+  #   vulnerable : php:8.4.26-fpm  (last release before the 2026-10-21 fixes)
+  #   patched    : php:8.4.27-fpm  (contains the state-reset + OOM patches)
+  # e.g.  $env:PHP_IMAGE="php:8.4.27-fpm"; docker compose ... up -d --force-recreate
+  fpm:
+    image: ${PHP_IMAGE:-php:8.4.26-fpm}
+    platform: linux/amd64
+    container_name: php84-fpm
+    volumes:
+      - ./www:/var/www/html:ro
+      - ./php.ini:/usr/local/etc/php/conf.d/zz-pwn84.ini:ro
+      - ./pool.conf:/usr/local/etc/php-fpm.d/www.conf:ro
+      - ../out84:/out
+    # Let the FPM worker (www-data) write the proof file readable on the host.
+    command: sh -c "chown -R www-data:www-data /out 2>/dev/null || true; exec php-fpm"
+    restart: unless-stopped
+
+  # nginx front-end: the ONLY exposure. Proxies .php to the internal pool.
+  web:
+    image: nginx:1.27-alpine
+    platform: linux/amd64
+    container_name: php84-nginx
+    ports:
+      - "127.0.0.1:8090:80"
+    volumes:
+      - ./www:/var/www/html:ro
+      - ./nginx-site.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - fpm
+    restart: unless-stopped

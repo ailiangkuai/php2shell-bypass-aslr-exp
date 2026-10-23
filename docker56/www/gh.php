@@ -1,20 +1,71 @@
 <?php
-// gh.php — CVE-2026-109619 FPM 路径验证靶场页（仅用于本机授权实验）。
+// gh.php — CVE-2026-109618 / CVE-2026-109619 靶场页（仅用于本机授权实验）。
 //
 // 角色：
-//   ?producer=1  生产者请求：正常 startup 后进入执行阶段，session_start()
-//                并写 $_SESSION（把请求拥有的状态发布到 worker 全局），
-//                然后通过 str_repeat 分配触发 memory_limit OOM fatal，
-//                打断 session 关闭时的匹配 reset —— PS(http_session_vars)
-//                与已释放的请求堆之间的引用被残留下来。
-//                （执行阶段 OOM 不杀 FPM child —— probe2_56.py/A2 已实证）
-//   ?consumer=1  消费者请求：multipart 带 PHP_SESSION_UPLOAD_PROGRESS，
-//                在正常 RINIT 之前经 rfc1867 回调触碰残留 session 全局态。
+//   ?stage=mk&sid=  建会话页：写入 marker，供 rd 判定后续写盘是否成功。
+//   ?stage=p3&sid=  CVE-2026-109618 生产者：$_SESSION 持 4MB 活串，脚本正常
+//                   结束；RSHUTDOWN -> php_session_flush -> php_session_encode
+//                   序列化需再分配 ~4M => 总量 ~8.5M > 8M，OOM 精确落在
+//                   encode 分配点。fatal bailout 被 session RSHUTDOWN 的
+//                   zend_try 吞掉 => s_write 永不执行 => 会话写盘被静默
+//                   丢弃（"OOM 后 shutdown 拿着半初始化请求状态继续跑"的
+//                   公告语义）。5.6.40 EOL，从未修复——与含漏洞的 8.4.26
+//                   行为一致；8.4.27 修复后此处会话完整落盘。
+//   ?stage=rd&sid=  回读判定页：抬限后回读，pad=0 证明写盘被丢弃。
+//   ?producer=1/2  CVE-2026-109619 生产者（残留全局态路线，见下）。
 //
 // 页面本身不做任何防护性清理 —— 这正是公告描述的生产者/消费者模型
 // （"publishes state during application execution after successful startup,
 //   reaches a fatal error, and then uses session upload progress as the
 //   early consumer"）。
+
+if (isset($_GET['stage'])) {
+    $v = $_GET['stage'];
+    // sid 透传（use_strict_mode=0，任意格式都接受；探针仍用纯字母数字）
+    if (!empty($_GET['sid'])) {
+        session_id($_GET['sid']);
+    }
+
+    if ($v === 'mk') {
+        session_start();
+        $_SESSION['marker'] = 'm1';
+        echo "mk done\n";
+        exit;
+    }
+
+    if ($v === 'p3') {
+        // 4MB：执行期基线(~0.5M)+4M=4.5M < 8M 通过；RSHUTDOWN encode 需再
+        // 造 ~4M 串 => 8.5M > 8M，OOM 精确落在 php_session_encode 分配点。
+        // （6MB 时执行期 str_repeat 自身就超限，永远走不到 shutdown 编码。）
+        session_start();
+        $_SESSION['pad'] = str_repeat('A', 4 * 1024 * 1024);
+        echo "published, dying at write\n";
+        exit;
+    }
+
+    if ($v === 'p3c') {
+        // 对照组：同形状但 1MB pad —— encode 时 ~2.5M < 8M 不触发 OOM，
+        // 会话应完整落盘（rd 回读 pad=1048576）。证明 p3 的丢盘是
+        // "OOM 落在 encode" 精确导致，而非探针/写盘路径本身的问题。
+        session_start();
+        $_SESSION['pad'] = str_repeat('A', 1 * 1024 * 1024);
+        echo "published, no OOM at write\n";
+        exit;
+    }
+
+    if ($v === 'rd') {
+        // 回读判定页抬限：让 ps_read 反序列化 4MB 会话必然成功，输出确定
+        // marker/pad —— pad=0 即证明 p3 的 OOM 场景下会话未被写盘（写盘被
+        // 静默丢弃）；pad=4194304 证明会话完整落盘（修复版行为）。
+        ini_set('memory_limit', '64M');
+        session_start();
+        $m = isset($_SESSION['marker']) ? $_SESSION['marker'] : '(none)';
+        $p = isset($_SESSION['pad']) ? strlen($_SESSION['pad']) : 0;
+        echo "marker={$m} pad={$p}\n";
+        exit;
+    }
+    exit;
+}
 
 if (isset($_GET['producer'])) {
     $mode = $_GET['producer'];

@@ -85,6 +85,17 @@ python3 exploit56.py 127.0.0.1:9090 -c '<?php system("cat /etc/passwd"); ?>'
 
 加上公告自己确认的"FPM startup 失败即杀 child"（与 probe2 实证一致），CVE-2026-109619 在 php-5.6-fpm 下三个窗口（startup 发布、执行阶段 fatal、RSHUTDOWN 内 fatal）全部无法留下可消费的残留：**该 CVE 的 FPM 路径在 5.6 结构性不可行，与上游不给 5.6 补丁的事实互恰**。
 
+### 窗口1（startup/multipart 解析期 OOM）的直接复现（tools56/probe5_56.py）
+
+窗口1此前只有 probe2 的间接证据；probe5 按 109619 原始模型做了带 session 组合的直接复现——A 请求（`PHPSESSID` + `PHP_SESSION_UPLOAD_PROGRESS` + 文件字段 f → FILE_START 在 RINIT 前发布 PS 全局 + 12MB 字段触发 rfc1867 `erealloc` OOM），紧接 B（END cleanup consumer）与 C（存活探测）：
+
+| 轮次 | A 响应 | child | 后续 B/C |
+|---|---|---|---|
+| 1-6（2026-10-23 06:56-07:15 手工/探针） | 200 空 chunked 或 502 | **exit(70)** → master 重拉 | 全正常 |
+| 2/2（probe5 修正版，07:33-07:34） | 200 空 chunked，无 fatal 文本（worker 先死，文本不可达） | 432→521→578，每轮 **exit(70)** | 全正常 |
+
+bailout 完整逃逸链（源码核对，详见 [logs/evidence56_109619.md](../logs/evidence56_109619.md)）：`rfc1867.c` erealloc OOM → `php_hash_environment`（php_variables.c L711，无独立 try）→ `php_request_startup` 的 `zend_try`（main.c L1616/L1685）吞 bailout 降级为 FAILURE → fpm_main.c L1927 对 startup FAILURE `return FPM_EXIT_SOFTWARE`(70)；即使逃过内层 try，外层 `zend_first_try`/`zend_catch`（L1915/L2045-2046）同样 exit(70)。**child 一死，已发布的 PS 全局随进程销毁，master 重拉的全新 child 从 MINIT 级全局开始——producer/consumer 不可能落在同一进程上**。
+
 ## 环境说明
 
 | 组件 | 版本 | 来源 |
@@ -95,6 +106,70 @@ python3 exploit56.py 127.0.0.1:9090 -c '<?php system("cat /etc/passwd"); ?>'
 | worker 模型 | 单 child、`pm.max_requests=0`（不回收） | [pool.conf](pool.conf) |
 
 `php.ini` 沿用 8.4 lab 的前提条件（display_errors、memory_limit=8M、upload_progress 等），便于对照实验；FastCGI 路径本身不依赖这些配置。
+
+## 测试执行指南（两个公告 CVE 的验证）
+
+前置：环境已起（`docker compose -f docker56/docker-compose.yml up -d`）、`curl -s http://127.0.0.1:8089/index.php` 输出 OK。命令在仓库根目录执行，均为纯 HTTP 打 nginx :8089。每条给出命令 → 关键输出 → 判定（**什么状态算符合 5.6.40 的预期结论**）。
+
+### 测试 1：CVE-2026-109618（OOM longjmp 早退 → 会话写盘丢弃）
+
+```bash
+python tools56/probe4_56.py --rounds 3
+```
+
+| 观测点 | 符合预期（漏洞语义复现） | 不符合预期 |
+|---|---|---|
+| p3 响应含 fatal | `p3-fatal-in-Unknown=True`（OOM 落在 RSHUTDOWN 编码内，无用户栈帧） | `False` → OOM 没落在 encode，查 memory_limit |
+| rd 回读 | `SESSION-LOST(pad=0)`：写盘被静默丢弃 | `SESSION-WRITTEN(pad>0)` → 修复版行为，5.6 不应出现 |
+| 对照组（自动追加） | `[ctrl] p3c(1MB pad) ... -> SESSION-WRITTEN(pad=1048576)`：证明丢盘是 OOM 精确导致而非写盘路径损坏 | `UNEXPECTED` → 退出码 1 且提示"对照组异常" |
+| 结尾判定 | `[+] CVE-2026-109618 语义观测成立`，退出码 **0** | 退出码 1 |
+| FPM 日志 | child 不换（probe 全程同一 PID），无 exit(70) | child 死 → 与 p3 变体语义冲突 |
+
+### 测试 2：CVE-2026-109619 窗口1（pre-RINIT OOM，本会话实测）
+
+```bash
+python tools56/probe5_56.py --rounds 2
+```
+
+| 观测点 | 符合预期（窗口1闭合 = 5.6 排除） | 不符合预期 |
+|---|---|---|
+| [A] 行 | `worker killed: pid X->Y, exit70_log=1`（OOM 后 child exit(70) + master 重拉） | child 存活且无 exit(70) → 退出码 3，查上传设置 |
+| A 响应 | 200 空 chunked 或 502（fatal 文本因 worker 先死不可达，**不要求**出现） | — |
+| [B]/[C] 行 | B 正常 200、C `ok=True` 且 PID 不再变（新 child 干净） | B-RESET / B-CRASH → 退出码 0，109619 可观测（5.6 不应出现） |
+| 结尾判定 | `verdicts: {'A-KILLED-WORKER': N}` + `WINDOW-1 CLOSED`，退出码 **1** | 退出码 0 |
+
+### 测试 3：CVE-2026-109619 窗口2/3（执行阶段 / RSHUTDOWN 内 OOM）
+
+```bash
+python tools56/probe3_56.py --producer 1 --rounds 3   # 窗口2：执行阶段 OOM fatal
+python tools56/probe3_56.py --producer 2 --rounds 3   # 窗口3：RSHUTDOWN ps_write OOM
+```
+
+| 观测点 | 符合预期（排除 = 无残留可消费） | 不符合预期 |
+|---|---|---|
+| producer 行 | `OOM-fatal=yes`、`child X->survived`（两变体 worker 都活着） | child DIED → 变体 A 不应杀 child |
+| consumer 行 | `-> NORMAL`，**无** `<== DIFFERS FROM BASELINE` | `GARBAGE`/`NO-COOKIE` 与基线不同 → 退出码 0，109619 可观测 |
+| 结尾判定 | `diffs=0` + `no behavioral difference`，退出码 **1** | 退出码 0 |
+
+### 测试 4（可选）：startup OOM 杀 child 的成分隔离
+
+```bash
+python tools56/probe2_56.py
+```
+
+预期：变体 a（无 OOM）`child survived`；变体 b/c/d（含 12MB big 字段）全部 `CHILD DIED`——任何 startup 期 OOM 都杀 child，与测试 2 的窗口1结论互恰。
+
+### 判定速查（状态 ↔ 结论映射）
+
+| 状态 | 含义 | 5.6.40 预期 |
+|---|---|---|
+| `SESSION-LOST(pad=0)` | 109618 漏洞语义：OOM 后 shutdown 丢写盘 | **出现**（3/3） |
+| `SESSION-WRITTEN(pad>0)` | 109618 修复版行为 | 不出现 |
+| `A-KILLED-WORKER` / exit(70) | 109619 窗口1闭合：残留随进程销毁 | **出现**（每轮） |
+| `B-CRASH` / `B-RESET` / `GARBAGE` / `DIFFERS FROM BASELINE` | 109619 残留被消费（UAF 可观测） | 不出现 |
+| `NORMAL`（consumer cookie 与基线一致） | 无残留 | 窗口2/3 **出现** |
+
+一句话验收：**测试 1 退出码 0（SESSION-LOST 3/3）+ 测试 2 退出码 1（A-KILLED-WORKER）+ 测试 3 退出码 1（diffs=0）= 两个公告 CVE 在 5.6.40 的完整模拟闭环**（109618 复现、109619 三窗口结构性排除）。
 
 ## 复现声明
 
