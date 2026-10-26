@@ -1,179 +1,91 @@
-# php2shell 56 — PHP 5.6.40 + nginx (php-fpm) 模式复现
+# php2shell 56 — PHP 5.6.40 + nginx (php-fpm) 生产参数攻击测试
 
-本目录是主 README（PHP 8.4.26 + Apache mod_php 模式）的姊妹篇：目标换成 **php:5.6.40-fpm + nginx 1.27**，利用路径与 8.4 完全不同。实测一条命令 RCE（`id`/`uname` 以 www-data 执行，proof 落盘 `out56/p56`）。
+本目录是一个 **生产参数靶场**：`php:5.6.40-fpm` 镜像，ini/pool 换成生产常态
+（`memory_limit=128M > post_max_size=8M`、多 worker + 回收），用于验证
+"线上 php5.6.40 + nginx 是否受 2026-10-21 公告影响"。
 
-## exp
+## 关键约束：不攻击 fpm 端口
 
-从零到 RCE 的完整命令，整段复制执行即可（在仓库根目录下）：
-
-```bash
-# 依赖：Docker Engine/Desktop + Docker Compose v2 + Python 3.9+（纯标准库，无第三方包）
-
-# 1) 起目标：php-fpm 单 worker + nginx 反代；fpm 的 9000 端口发布到宿主机
-#    127.0.0.1:9090（模拟真实世界 "fpm 端口暴露" 的配置失误）
-docker compose -f docker56/docker-compose.yml up -d
-
-# 2) 确认两条链路都通
-curl -s http://127.0.0.1:8089/index.php          # nginx -> fpm，输出 OK
-Test-NetConnection 127.0.0.1 -Port 9090          # Windows；Linux 用 nc -vz 127.0.0.1 9090
-
-# 3) 一条命令完成利用
-python3 exploit56.py 127.0.0.1:9090
-# [[P56-PROOF-BEGIN]]
-# php_version=5.6.40
-# sapi=fpm-fcgi
-# id=uid=33(www-data) gid=33(www-data) groups=33(www-data)
-# uname=Linux ... x86_64 GNU/Linux
-# [[P56-PROOF-END]]
-# [+] RCE confirmed — proof block received.
-
-# 4) proof 已写回宿主机
-cat out56/p56
-```
-
-任意 PHP 代码（payload 需自带 `<?php ?>` 标签）：
-
-```bash
-python3 exploit56.py 127.0.0.1:9090 -c '<?php system("cat /etc/passwd"); ?>'
-```
-
-常用参数：`-f/--file`（容器内真实 PHP 脚本路径，默认 `/var/www/html/index.php`）、`-c/--code`、`--php-value`（默认 `auto_prepend_file = php://input`）、`--php-admin-value`（默认 `allow_url_include = On`）、`--timeout`。
-
-## 机制概览
-
-攻击面是 **FastCGI 直连 + INI 覆盖**，全程不碰内存，ASLR 无关：
-
-1. **暴露面**：`docker-compose.yml` 把 fpm 的 TCP 9000 发布到宿主机（经典失误配置，参考 Shutterstock 等真实事件）。nginx 正常反代下客户端无法注入参数，直连 fpm 才是前提。
-2. **注入**：FastCGI 协议允许 FCGI_PARAMS 携带两个 FPM 特殊键：
-   - `PHP_VALUE = auto_prepend_file = php://input` — 在执行 SCRIPT_FILENAME 前先 include 请求体；
-   - `PHP_ADMIN_VALUE = allow_url_include = On` — 5.6 的 `fpm_php.c` 对 admin 值不做 modifiable 校验，SYSTEM 级 ini 也能覆盖。
-3. **执行**：任意 PHP 代码放 FCGI_STDIN（即 POST body），`php://input` 流被当作 PHP 模板解析 → 任意代码执行。
-4. `exploit56.py` 自实现 FastCGI 协议客户端（BEGIN_REQUEST → PARAMS → STDIN → 解析 STDOUT/STDERR/END_REQUEST），约 300 行纯标准库。
-
-## 为什么不是 8.4 那条 UAF 链（实证结论）
-
-8.4 exploit 的根基是 Apache worker 在 request startup 阶段 OOM bailout 后**存活**、脏堆被下一请求复用。在 PHP 5.6 FPM 下该前提不成立：
-
-| 对照实验（tools56/probe2_56.py） | 结果 |
-|---|---|
-| 1001 字段 + upload_progress + 文件上传（无 OOM） | child 存活 |
-| 纯 OOM（12MB 字段触发 memory_limit） | **child exit(70)** |
-| 完整 A 请求（OOM + session 组合） | **child exit(70)** |
-| 1001 字段 + 大字段（无 session） | **child exit(70)** |
-
-结论：任何 startup 阶段 OOM bailout 都会走 `php_request_startup` 返回 FAILURE → `exit(FPM_EXIT_SOFTWARE=70)`，worker 连同脏堆一起销毁，跨请求 UAF 无从谈起。结构性排除，不是标定问题。
-
-其余路径同样排除：
-
-- **CVE-2019-11043**（`fpm_main.c` 下溢 bug）：5.6.40 源码存在该 bug，但公开利用 phuip-fpizdam 依赖 PHP 7 的 `_fcgi_data_seg` 结构；且本 nginx 无 `fastcgi_split_path_info`/PATH_INFO 配置。双重不适用。
-- **执行阶段 OOM**（`php_execute_script` 内 bailout 不杀 worker，源码已验证）：理论上 worker 可存活，但靶场页面只有 `echo "OK"`，没有应用侧触发点。
-- session 注入无 LFI 消费者、图片马、alias 穿越、PATH_INFO 等均不可行。
-
-## 公告 FPM 路径（CVE-2026-109619）的对照验证 —— 也排除
-
-2026-10-21 公告（GHSA-6wmf-4rv5-p3rp）描述的 FPM 侧利用需"producer/consumer 成对"：应用执行阶段发布全局状态 → fatal/OOM 打断匹配的 reset → 下一请求在正常初始化前消费残留。按此模型搭了验证环境实测（tools56/probe3_56.py，靶场页 [www/gh.php](www/gh.php)）：
-
-| 生产者变体 | OOM 位置 | producer 响应 | child | consumer cookie vs 基线(NORMAL) |
-|---|---|---|---|---|
-| A：执行阶段 `str_repeat` OOM fatal | `php_execute_script` 内 | 200，OOM fatal，输出已发布 | 存活 | **无差异**（3 轮全 NORMAL） |
-| B：`$_SESSION` 持 6MB 活串正常结束，OOM 落在 RSHUTDOWN 的 `ps_write` 序列化 | `php_request_shutdown` 内（`in Unknown on line 0`） | 200，OOM fatal | 存活 | **无差异**（3 轮全 NORMAL） |
-
-负结果的源码解释（php-src PHP-5.6.40 `ext/session/session.c`）：
-
-- 变体 B：`PHP_RSHUTDOWN_FUNCTION(session)` 把 `php_session_flush` 包在 `zend_try` 里（L2414-2416），序列化 OOM bailout 被捕获后仍执行 `php_rshutdown_session_globals`（L2417），`PS(id)`/`PS(http_session_vars)` 被正常置空——8.4 那种"悬空 PS(id)"在 5.6 被 2006 年就存在的 zend_try 防住。
-- 变体 A：执行阶段 fatal 后 FPM 的 `php_request_shutdown` 完整跑完模块 RSHUTDOWN（变体 B 的 zend_try 同样覆盖该路径），session 全局态正常重置。
-
-加上公告自己确认的"FPM startup 失败即杀 child"（与 probe2 实证一致），CVE-2026-109619 在 php-5.6-fpm 下三个窗口（startup 发布、执行阶段 fatal、RSHUTDOWN 内 fatal）全部无法留下可消费的残留：**该 CVE 的 FPM 路径在 5.6 结构性不可行，与上游不给 5.6 补丁的事实互恰**。
-
-### 窗口1（startup/multipart 解析期 OOM）的直接复现（tools56/probe5_56.py）
-
-窗口1此前只有 probe2 的间接证据；probe5 按 109619 原始模型做了带 session 组合的直接复现——A 请求（`PHPSESSID` + `PHP_SESSION_UPLOAD_PROGRESS` + 文件字段 f → FILE_START 在 RINIT 前发布 PS 全局 + 12MB 字段触发 rfc1867 `erealloc` OOM），紧接 B（END cleanup consumer）与 C（存活探测）：
-
-| 轮次 | A 响应 | child | 后续 B/C |
-|---|---|---|---|
-| 1-6（2026-10-23 06:56-07:15 手工/探针） | 200 空 chunked 或 502 | **exit(70)** → master 重拉 | 全正常 |
-| 2/2（probe5 修正版，07:33-07:34） | 200 空 chunked，无 fatal 文本（worker 先死，文本不可达） | 432→521→578，每轮 **exit(70)** | 全正常 |
-
-bailout 完整逃逸链（源码核对，详见 [logs/evidence56_109619.md](../logs/evidence56_109619.md)）：`rfc1867.c` erealloc OOM → `php_hash_environment`（php_variables.c L711，无独立 try）→ `php_request_startup` 的 `zend_try`（main.c L1616/L1685）吞 bailout 降级为 FAILURE → fpm_main.c L1927 对 startup FAILURE `return FPM_EXIT_SOFTWARE`(70)；即使逃过内层 try，外层 `zend_first_try`/`zend_catch`（L1915/L2045-2046）同样 exit(70)。**child 一死，已发布的 PS 全局随进程销毁，master 重拉的全新 child 从 MINIT 级全局开始——producer/consumer 不可能落在同一进程上**。
+生产环境 FPM 的 9000 端口从不对外暴露（只监听容器内网供 nginx `fastcgi_pass`）。
+因此本靶场 **刻意不映射 9000**，所有测试流量只走 nginx 入口 `127.0.0.1:8091`。
+直连 9000 测出来的"可达性"在生产里没有对应路径，没有意义。
 
 ## 环境说明
 
-| 组件 | 版本 | 来源 |
+| 组件 | 版本/配置 | 说明 |
 |---|---|---|
 | PHP | 5.6.40（fpm-fcgi） | `php:5.6.40-fpm` |
-| nginx | 1.27（alpine） | 反代 `fpm:9000`，宿主机 `127.0.0.1:8089` |
-| fpm 暴露面 | 宿主机 `127.0.0.1:9090` → 容器 9000 | [docker-compose.yml](docker-compose.yml) |
-| worker 模型 | 单 child、`pm.max_requests=0`（不回收） | [pool.conf](pool.conf) |
+| nginx | 1.27（alpine） | 反代 `fpm:9000`，宿主机 `127.0.0.1:8091` |
+| fpm 暴露面 | 无（不映射端口） | 仅容器内网 9000，供 nginx `fastcgi_pass` |
+| memory_limit / post_max_size | 128M / 8M | 生产常态，`memory_limit > post_max_size` |
+| worker 模型 | 多 worker（5）+ `pm.max_requests=500` | [pool.conf](pool.conf) |
+| display_errors | Off | 生产常态，错误不外泄 |
 
-`php.ini` 沿用 8.4 lab 的前提条件（display_errors、memory_limit=8M、upload_progress 等），便于对照实验；FastCGI 路径本身不依赖这些配置。
+关键文件：
 
-## 测试执行指南（两个公告 CVE 的验证）
+- [docker-compose.yml](docker-compose.yml) — 编排（fpm 无端口映射）
+- [php.ini](php.ini) — 生产参数
+- [pool.conf](pool.conf) — 多 worker + 回收
+- [nginx-site.conf](nginx-site.conf) — `client_max_body_size 32m`
+- [www/index.php](www/index.php) — worker PID 回显（靶场特权页，线上无）
+- [www/diag.php](www/diag.php) — 配置/闸门标定页（靶场特权页，线上无）
 
-前置：环境已起（`docker compose -f docker56/docker-compose.yml up -d`）、`curl -s http://127.0.0.1:8089/index.php` 输出 OK。命令在仓库根目录执行，均为纯 HTTP 打 nginx :8089。每条给出命令 → 关键输出 → 判定（**什么状态算符合 5.6.40 的预期结论**）。
-
-### 测试 1：CVE-2026-109618（OOM longjmp 早退 → 会话写盘丢弃）
-
-```bash
-python tools56/probe4_56.py --rounds 3
-```
-
-| 观测点 | 符合预期（漏洞语义复现） | 不符合预期 |
-|---|---|---|
-| p3 响应含 fatal | `p3-fatal-in-Unknown=True`（OOM 落在 RSHUTDOWN 编码内，无用户栈帧） | `False` → OOM 没落在 encode，查 memory_limit |
-| rd 回读 | `SESSION-LOST(pad=0)`：写盘被静默丢弃 | `SESSION-WRITTEN(pad>0)` → 修复版行为，5.6 不应出现 |
-| 对照组（自动追加） | `[ctrl] p3c(1MB pad) ... -> SESSION-WRITTEN(pad=1048576)`：证明丢盘是 OOM 精确导致而非写盘路径损坏 | `UNEXPECTED` → 退出码 1 且提示"对照组异常" |
-| 结尾判定 | `[+] CVE-2026-109618 语义观测成立`，退出码 **0** | 退出码 1 |
-| FPM 日志 | child 不换（probe 全程同一 PID），无 exit(70) | child 死 → 与 p3 变体语义冲突 |
-
-### 测试 2：CVE-2026-109619 窗口1（pre-RINIT OOM，本会话实测）
+## 操作流程
 
 ```bash
-python tools56/probe5_56.py --rounds 2
+# 1) 起生产参数靶场（fpm 无端口映射，只有 nginx 8091）
+docker compose -f docker56/docker-compose.yml up -d
+
+# 2) 确认唯一入口是 nginx，且 fpm 无对外端口
+curl -s http://127.0.0.1:8091/index.php        # 期望: pid=<n> ok
+docker port php56-fpm                            # 期望: 空（无任何端口映射）
+
+# 3) 跑窗口1 验证探针（只经 nginx，默认 3 轮）
+python tools56/probe6_prod.py --rounds 3
+
+# 可选：模拟线上拿不到 PID 的判定（纯状态码）
+python tools56/probe6_prod.py --rounds 3 --no-pid
 ```
 
-| 观测点 | 符合预期（窗口1闭合 = 5.6 排除） | 不符合预期 |
+## 怎样判断"被攻破"
+
+probe6 会向靶场发一个 `Content-Length` 超过 `post_max_size` 的 multipart 攻击请求
+（含 `PHP_SESSION_UPLOAD_PROGRESS` + 文件字段 + 大字段，与公告窗口1 的 A 请求同构）。
+判定只看**这个攻击请求自身的响应状态码**：
+
+| 攻击请求响应 | 含义 | 结论 |
 |---|---|---|
-| [A] 行 | `worker killed: pid X->Y, exit70_log=1`（OOM 后 child exit(70) + master 重拉） | child 存活且无 exit(70) → 退出码 3，查上传设置 |
-| A 响应 | 200 空 chunked 或 502（fatal 文本因 worker 先死不可达，**不要求**出现） | — |
-| [B]/[C] 行 | B 正常 200、C `ok=True` 且 PID 不再变（新 child 干净） | B-RESET / B-CRASH → 退出码 0，109619 可观测（5.6 不应出现） |
-| 结尾判定 | `verdicts: {'A-KILLED-WORKER': N}` + `WINDOW-1 CLOSED`，退出码 **1** | 退出码 0 |
+| **200**，body 正常 `pid=.. ok` | `post_max_size` 在 rfc1867.c:715 于 FILE_START 之前拦截，multipart 解析未开始，OOM 未触发，worker 存活 | **未被攻破（窗口1 闭合）** |
+| **502 / 504** | 解析期 OOM 把 worker 打死（`exit(70)`），nginx 拿不到响应 | **被攻破（窗口1 打开）** |
 
-### 测试 3：CVE-2026-109619 窗口2/3（执行阶段 / RSHUTDOWN 内 OOM）
+辅助信号（仅靶场可见，生产拿不到，不构成攻击路径）：
 
-```bash
-python tools56/probe3_56.py --producer 1 --rounds 3   # 窗口2：执行阶段 OOM fatal
-python tools56/probe3_56.py --producer 2 --rounds 3   # 窗口3：RSHUTDOWN ps_write OOM
-```
+- worker PID 变化（多 worker 下不可靠，只作辅助）；
+- `docker logs php56-fpm` 出现 `child N exited with code 70`。
 
-| 观测点 | 符合预期（排除 = 无残留可消费） | 不符合预期 |
-|---|---|---|
-| producer 行 | `OOM-fatal=yes`、`child X->survived`（两变体 worker 都活着） | child DIED → 变体 A 不应杀 child |
-| consumer 行 | `-> NORMAL`，**无** `<== DIFFERS FROM BASELINE` | `GARBAGE`/`NO-COOKIE` 与基线不同 → 退出码 0，109619 可观测 |
-| 结尾判定 | `diffs=0` + `no behavioral difference`，退出码 **1** | 退出码 0 |
+**"被攻破"的两层含义**：
 
-### 测试 4（可选）：startup OOM 杀 child 的成分隔离
+1. **DoS 层（本测试可直接观测）**：攻击请求能远程打死 worker（502 / exit 70）。这表示你的 `post_max_size` 配得过大（能容纳攻击 body 且 ≥ memory_limit），解析期 OOM 窗口被打开，攻击者可反复请求让 worker 崩溃重启、造成服务抖动。**这是本测试判定"被攻破"的直接信号。**
+2. **RCE 层（公告完整链）**：需要 worker 死亡后残留状态被下一请求消费。5.6 FPM 下多 worker + `max_requests` 回收 + 解析期 OOM 直接杀 worker，跨请求残留结构上不成立，不会走到这一步。
 
-```bash
-python tools56/probe2_56.py
-```
+## 参数配比决定可达性（翻转实验）
 
-预期：变体 a（无 OOM）`child survived`；变体 b/c/d（含 12MB big 字段）全部 `CHILD DIED`——任何 startup 期 OOM 都杀 child，与测试 2 的窗口1结论互恰。
+把 [php.ini](php.ini) 的 `memory_limit`/`post_max_size` 两个数字对调（8M/64M）再重测，
+probe6 会从 `200/存活` 翻转为 `502/exit 70`——证明"是否被攻破"由这两个参数的相对大小决定，
+与 PHP 5.6.40 版本号无关。
 
-### 判定速查（状态 ↔ 结论映射）
+一句话验收：**攻击请求一直 200 = 你的 `post_max_size` 挡住了它，未被攻破；出现 502/504 = `post_max_size` 没挡住，窗口1 被打开，被攻破（DoS 层）。**
 
-| 状态 | 含义 | 5.6.40 预期 |
-|---|---|---|
-| `SESSION-LOST(pad=0)` | 109618 漏洞语义：OOM 后 shutdown 丢写盘 | **出现**（3/3） |
-| `SESSION-WRITTEN(pad>0)` | 109618 修复版行为 | 不出现 |
-| `A-KILLED-WORKER` / exit(70) | 109619 窗口1闭合：残留随进程销毁 | **出现**（每轮） |
-| `B-CRASH` / `B-RESET` / `GARBAGE` / `DIFFERS FROM BASELINE` | 109619 残留被消费（UAF 可观测） | 不出现 |
-| `NORMAL`（consumer cookie 与基线一致） | 无残留 | 窗口2/3 **出现** |
+## 线上自查清单（按优先级）
 
-一句话验收：**测试 1 退出码 0（SESSION-LOST 3/3）+ 测试 2 退出码 1（A-KILLED-WORKER）+ 测试 3 退出码 1（diffs=0）= 两个公告 CVE 在 5.6.40 的完整模拟闭环**（109618 复现、109619 三窗口结构性排除）。
+1. `memory_limit` vs `post_max_size`（决定性）：只要 `memory_limit > post_max_size`，窗口1 就不可达。
+2. `upload_max_filesize`：上传文件单字段上限，通常 `< post_max_size`，进一步缩小面。
+3. `session.upload_progress.enabled`：若为 `Off`，公告链的 session 面整体不存在。
+4. nginx `client_max_body_size`：第一道硬闸，默认 1m 会先把超限流量挡在 413。
+5. `display_errors`：生产应为 `Off`，此时判据只能靠状态码（200 vs 502）。
+6. `pm.max_children` / `pm.max_requests`：多 worker + 回收使跨请求 producer/consumer 无法落在同一进程上。
 
 ## 复现声明
 
-- **一条命令 RCE**：`python3 exploit56.py 127.0.0.1:9090`，无需偏移标定、无需重试循环、无需 worker 轮换。
-- **前提**：攻击者可达 fpm 监听端口（本 lab 通过 compose 端口发布模拟）。若 fpm 仅绑定 unix socket 或端口不可达，本路径不成立，5.6-fpm 下也无其他可行 RCE 路径（见上）。
-- **与 8.4 模式的关系**：最终产物相同（以 web 用户执行任意命令），但 8.4 是"应用零漏洞、纯打引擎 bug + 绕 ASLR"，本模式是"真实世界配置失误型攻击面"，两者互补展示同一目标的不同深度。
+- 本测试只经 nginx 入口，不攻击 fpm 端口，模拟生产"fpm 端口不外露"的真实前提。
 - 仅用于授权环境中的漏洞研究与复现。
